@@ -76,6 +76,25 @@ class PurgeIn(BaseModel):
         return v
 
 
+class ViewPassIn(BaseModel):
+    """封存人就已开封资料签发一次性阅览凭证：带时区的阅览截止时刻。"""
+
+    expires_at: datetime  # 必须带时区、晚于当前、且早于已安排的清除时刻
+
+    @field_validator("expires_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("阅览截止时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
+        return v
+
+
+class ViewPassRedeemIn(BaseModel):
+    """无账号外部复核人凭明文凭证兑换一次正文。"""
+
+    token: str = Field(min_length=1, max_length=256)
+
+
 # ---------------------------------------------------------------------------
 # 审计快照离线验真
 #

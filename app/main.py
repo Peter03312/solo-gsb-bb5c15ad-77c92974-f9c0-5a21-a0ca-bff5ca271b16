@@ -45,6 +45,17 @@
   复核人凭“快照 + 签名 + 事先信任的公钥”离线验真，字段或记录顺序被篡改、
   签名不匹配、版本不支持或公钥无效均明确失败，且不以包内自带公钥建立信任；
   签发在同一写事务内先完成确定性结算再取数，快照始终对应一个已提交的一致状态；
+- 当前封存人可就**已开封**资料凭资料编号与带时区阅览截止时刻签发**一次性阅览
+  凭证**给无账号外部复核人：截止时刻须晚于当前且严格早于已安排的清除时刻
+  （未安排清除不能签发）；凭证明文为不可猜测的随机串，库内只存 SHA-256 摘要，
+  明文仅在签发响应中返回一次，响应同时给出供撤销使用的凭证编号；
+- 外部复核人无需账号，凭明文在截止前可且仅可读取一次正文及摘要：兑换临界区
+  先结算到期清除（清除时刻与兑换同刻以清除优先，拒绝兑换且不返回正文），
+  再以“条件更新 + 行写锁”把 active 凭证原子置为 redeemed，并发兑换至多一次
+  成功；过期、撤销、已兑付、无效凭证或已清除资料统一 404，不泄露正文或资料
+  存在性，且拒绝路径不写任何记录；
+- 当前封存人凭凭证编号可在兑换前撤销（资料到清除时刻或被改期清除的同样拒绝）；
+  签发、成功兑换、撤销均按顺序追加到原有 audit_log 审计链；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 """
 import asyncio
@@ -77,6 +88,8 @@ from .schemas import (
     RevokeIn,
     SealIn,
     VerifySnapshotIn,
+    ViewPassIn,
+    ViewPassRedeemIn,
 )
 
 # ---------------------------------------------------------------------------
@@ -487,7 +500,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -1768,6 +1781,237 @@ def cancel_purge(
                 detail=f"封存人取消到期清除（原清除时刻: {previous}）",
             )
             result = {"document_id": doc_id, "status": doc["status"], "purge_at": None}
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 一次性阅览凭证（view pass）
+#
+# 当前封存人把**已开封**资料的正文临时交给无账号的外部复核人：
+#   1) 签发 POST /documents/{id}/view-passes：凭资料编号 + 带时区阅览截止时刻；
+#      截止时刻须晚于当前、且严格早于已安排的清除时刻（未安排清除不能签发）。
+#      凭证明文为 256 位不可猜测随机串，库内只存 SHA-256 摘要；明文仅在本次
+#      响应中返回，响应同时给出供撤销使用的凭证编号（pass_id）。
+#   2) 兑换 POST /view-passes/redeem：无需任何账号凭据，凭明文在截止前读取一次
+#      正文与摘要。兑换临界区先在同一事务内结算到期清除——清除时刻与兑换同刻
+#      时清除优先（先提交清除，再拒绝兑换）；随后以条件更新把 active 凭证原子
+#      置为 redeemed，并发兑换至多一次成功。过期/撤销/已兑付/无效/已清除统一
+#      404 且文案相同，不泄露正文或资料存在性；拒绝路径不写任何记录。
+#   3) 撤销 POST /view-passes/{id}/revoke：当前封存人凭凭证编号在兑换前撤销。
+# 签发、成功兑换、撤销均追加到原有 audit_log 审计链（兑换的 actor 为空，
+# 因为外部复核人没有账号）。
+# ---------------------------------------------------------------------------
+
+# 兑换类失败统一文案与状态码：调用方无法据此区分凭证是否存在、资料是否存在
+VIEW_PASS_REJECTED = 404
+VIEW_PASS_REJECTED_MSG = "凭证无效、已过期、已撤销、已兑付，或资料已清除"
+
+
+@app.post("/documents/{doc_id}/view-passes", status_code=201)
+def issue_view_pass(
+    doc_id: int,
+    payload: ViewPassIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """封存人为已开封资料签发一次性阅览凭证。"""
+    doc = load_doc_for_participant(db, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, "只有封存人可以签发阅览凭证")
+
+    expires_at = utc_str(payload.expires_at)
+    now = utc_str(now_utc())
+    if expires_at <= now:
+        raise err(400, "阅览截止时刻必须晚于当前时间")
+
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 临界区第一步与其他写路径一致：先确定性到点开封，再结算到期清除，
+        # 避免签发与定时开封/清除赛跑（同刻时清除优先由 resolve_due_waiting
+        # 的 purge_at 比较保证；清除若在本临界区生效，先提交，再拒绝签发）。
+        resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now, doc_id)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["owner_id"] != user["id"]:
+            raise err(403, "只有封存人可以签发阅览凭证")
+        if doc["status"] == "purged":
+            # 清除可能刚在本临界区生效：先提交，错误延迟到提交后返回
+            post_commit_error = err(409, "资料已清除，不能签发阅览凭证")
+        elif doc["status"] != "opened":
+            raise err(409, "资料尚未开封，只能为已开封资料签发阅览凭证")
+        elif doc["purge_at"] is None:
+            raise err(409, "资料尚未安排到期清除，不能签发阅览凭证")
+        elif not expires_at < doc["purge_at"]:
+            raise err(400, "阅览截止时刻必须早于已安排的清除时刻")
+        else:
+            # 256 位不可猜测随机串；库内只存 SHA-256 摘要，明文仅此一次返回
+            token = secrets.token_urlsafe(32)
+            cur = tx.execute(
+                "INSERT INTO view_passes"
+                " (document_id, token_hash, status, expires_at, issued_by, created_at)"
+                " VALUES (?, ?, 'active', ?, ?, ?)",
+                (doc_id, sha256_hex(token), expires_at, user["id"], now),
+            )
+            pass_id = cur.lastrowid
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="view_pass_issued",
+                document_id=doc_id,
+                detail=(
+                    f"签发一次性阅览凭证 {pass_id}，阅览截止时刻: {expires_at}"
+                    f"（早于清除时刻 {doc['purge_at']}）；库内仅保存凭证摘要，"
+                    "明文仅本次返回，外部复核人可在截止前无账号读取正文一次"
+                ),
+            )
+            result = {
+                "pass_id": pass_id,
+                "document_id": doc_id,
+                "status": "active",
+                "token": token,
+                "expires_at": expires_at,
+                "purge_at": doc["purge_at"],
+                "created_at": now,
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.post("/view-passes/redeem")
+def redeem_view_pass(
+    payload: ViewPassRedeemIn,
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """外部复核人无需账号，凭明文在截止前兑换一次正文与摘要。
+
+    所有失败（无效凭证、过期、撤销、已兑付、资料已清除）统一返回同一个 404，
+    不区分原因，绝不泄露正文或资料/凭证的存在性；失败不写任何记录。
+    """
+    token_hash = sha256_hex(payload.token)
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 先按摘要定位凭证（BEGIN IMMEDIATE 已取得写锁，随后的状态判定无并发窗口）
+        vp = tx.execute(
+            "SELECT * FROM view_passes WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        if vp is None:
+            raise err(VIEW_PASS_REJECTED, VIEW_PASS_REJECTED_MSG)
+        doc_id = vp["document_id"]
+
+        # 兑换前须在同一事务结算到期清除：清除时刻与兑换同刻（<=）时清除优先。
+        # 清除先随本事务提交，拒绝延迟到提交后再返回，不能让回滚撤销已生效的清除。
+        purged_here = purge_due_documents(tx, now, doc_id) > 0
+
+        vp = tx.execute("SELECT * FROM view_passes WHERE id = ?", (vp["id"],)).fetchone()
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+
+        if doc["status"] == "purged":
+            if purged_here:
+                post_commit_error = err(VIEW_PASS_REJECTED, VIEW_PASS_REJECTED_MSG)
+            else:
+                raise err(VIEW_PASS_REJECTED, VIEW_PASS_REJECTED_MSG)
+        elif vp["status"] != "active":
+            # 撤销 / 已兑付同一结论
+            raise err(VIEW_PASS_REJECTED, VIEW_PASS_REJECTED_MSG)
+        elif vp["expires_at"] <= now:
+            # 过期（截止时刻本身不再可兑换；过期状态不改写凭证行，失败不留痕）
+            raise err(VIEW_PASS_REJECTED, VIEW_PASS_REJECTED_MSG)
+        else:
+            # 条件更新原子兑付：仅 active -> redeemed 生效，并发兑换至多一行成功
+            cur = tx.execute(
+                "UPDATE view_passes SET status='redeemed', redeemed_at=?"
+                " WHERE id=? AND status='active'",
+                (now, vp["id"]),
+            )
+            if cur.rowcount != 1:
+                raise err(VIEW_PASS_REJECTED, VIEW_PASS_REJECTED_MSG)
+            add_audit(
+                tx,
+                actor_id=None,  # 外部复核人无账号
+                action="view_pass_redeemed",
+                document_id=doc_id,
+                detail=f"一次性阅览凭证 {vp['id']} 已由外部复核人成功兑换，正文仅本次返回，凭证随即失效",
+            )
+            result = {
+                "pass_id": vp["id"],
+                "document_id": doc_id,
+                "status": "redeemed",
+                "body": doc["body"],
+                "digest": doc["digest"],
+                "expires_at": vp["expires_at"],
+                "redeemed_at": now,
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.post("/view-passes/{pass_id}/revoke")
+def revoke_view_pass(
+    pass_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """当前封存人凭凭证编号在兑换前撤销一次性阅览凭证。"""
+    vp = db.execute("SELECT * FROM view_passes WHERE id = ?", (pass_id,)).fetchone()
+    if vp is None:
+        raise err(403, "无权操作该凭证或凭证不存在")
+    doc = db.execute("SELECT * FROM documents WHERE id = ?", (vp["document_id"],)).fetchone()
+    if doc is None or doc["owner_id"] != user["id"]:
+        raise err(403, "无权操作该凭证或凭证不存在")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 与其他写路径一致：先确定性到点开封，再结算该资料的到期清除
+        resolve_due_waiting(tx, now)
+        purged_here = purge_due_documents(tx, now, vp["document_id"]) > 0
+
+        vp = tx.execute("SELECT * FROM view_passes WHERE id = ?", (pass_id,)).fetchone()
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (vp["document_id"],)).fetchone()
+        if doc["owner_id"] != user["id"]:
+            raise err(403, "只有当前封存人可以撤销该凭证")
+        if doc["status"] == "purged":
+            # 清除若在本临界区刚生效，必须先提交，错误延迟到提交后返回
+            post_commit_error = err(409, "资料已清除，凭证已失效，无法撤销")
+        elif purged_here:  # 防御性：与上一分支等价的先提交语义
+            post_commit_error = err(409, "资料已清除，凭证已失效，无法撤销")
+        elif vp["status"] == "redeemed":
+            raise err(409, "凭证已兑付，不能撤销")
+        elif vp["status"] == "revoked":
+            raise err(409, "凭证已撤销")
+        elif vp["expires_at"] <= now:
+            raise err(409, "凭证已过阅览截止时刻，不能撤销")
+        else:
+            tx.execute(
+                "UPDATE view_passes SET status='revoked', revoked_at=?"
+                " WHERE id=? AND status='active'",
+                (now, pass_id),
+            )
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="view_pass_revoked",
+                document_id=vp["document_id"],
+                detail=f"封存人在兑换前撤销一次性阅览凭证 {pass_id}",
+            )
+            result = {
+                "pass_id": pass_id,
+                "document_id": vp["document_id"],
+                "status": "revoked",
+                "revoked_at": now,
+            }
     if post_commit_error is not None:
         raise post_commit_error
     assert result is not None

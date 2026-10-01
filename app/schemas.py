@@ -76,6 +76,25 @@ class PurgeIn(BaseModel):
         return v
 
 
+class ReadingPassIn(BaseModel):
+    """封存人就已开封资料签发一次性阅览凭证：截止时刻必须带时区。"""
+
+    expires_at: datetime  # 兑换截止时刻，例如 2026-10-01T12:00:00Z
+
+    @field_validator("expires_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("截止时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
+        return v
+
+
+class RedeemReadingPassIn(BaseModel):
+    """外部复核人凭明文凭证一次性兑换正文；无需账号。"""
+
+    token: str = Field(min_length=1, max_length=512)
+
+
 # ---------------------------------------------------------------------------
 # 审计快照离线验真
 #

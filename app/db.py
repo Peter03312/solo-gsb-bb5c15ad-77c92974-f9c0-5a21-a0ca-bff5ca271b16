@@ -91,6 +91,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_document ON audit_log(document_id);
 
+-- 一次性阅览凭证：当前封存人向无账号的外部复核人临时签发已开封资料的正文。
+-- 明文仅在签发响应中出现一次，库内只存 SHA-256 摘要；凭证编号自增、非随机，
+-- 供封存人在兑换前撤销。过期是“截止时刻已过”的确定性派生状态（兑换/撤销时
+-- 在写事务内判定，不依赖后台扫描），因此不设独立的 expired 状态。
+CREATE TABLE IF NOT EXISTS reading_passes (
+    id           INTEGER PRIMARY KEY,
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    issued_by    INTEGER NOT NULL REFERENCES users(id),  -- 签发时的封存人
+    token_hash   TEXT NOT NULL UNIQUE,        -- 明文凭证的 SHA-256（hex），明文不落库
+    expires_at   TEXT NOT NULL,               -- 兑换截止时刻（UTC，字符串可排序）
+    status       TEXT NOT NULL CHECK (status IN ('active', 'redeemed', 'revoked')),
+    created_at   TEXT NOT NULL,
+    redeemed_at  TEXT,
+    revoked_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reading_passes_document ON reading_passes(document_id);
+
 -- 审计快照签名密钥：单行表，首次使用时生成并持久化，
 -- 重启后旧快照签名仍可验证；secret_seed 仅服务端持有，任何接口不返回。
 CREATE TABLE IF NOT EXISTS signing_keys (

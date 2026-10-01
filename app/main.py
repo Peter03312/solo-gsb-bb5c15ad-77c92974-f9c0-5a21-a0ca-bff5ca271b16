@@ -37,6 +37,13 @@
   待确认交接邀请失效；清除与最早开封同刻时清除优先，开封更早则先开封；
   已清除资料不能再开封、替换见证人、交接或再安排清除；已到期的改期或取消
   一律拒绝且不泄露正文；
+- 当前封存人可为已开封资料签发不可猜测的**一次性阅览凭证**（明文 256 位
+  随机串，仅签发响应返回一次，库内只存 SHA-256 摘要），交无账号的外部复核人
+  临时代阅：截止时刻带时区、在未来且严格早于已安排的清除时刻；外部复核人
+  无需账号，凭明文在截止前可读取一次正文及摘要，并发兑换至多一次成功；
+  当前封存人可凭凭证编号在兑换前撤销；兑换前先在同一事务结算到期清除，
+  清除时刻与兑换同刻时清除优先；过期、撤销、已兑付、无效凭证或已清除资料
+  统一拒绝且不泄露正文或资料存在性；签发、兑付、撤销均追加原有审计链；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
   到期/替换见证人/交接确认/到期清除只有一个已提交结果；
 - 当前封存人或当前指定见证人可在到点开封、清除等结算完成后签发**审计快照**：
@@ -72,6 +79,8 @@ from .schemas import (
     HandoverIn,
     OpenRequestIn,
     PurgeIn,
+    ReadingPassIn,
+    RedeemReadingPassIn,
     RegisterIn,
     ReplaceWitnessIn,
     RevokeIn,
@@ -487,7 +496,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -1768,6 +1777,238 @@ def cancel_purge(
                 detail=f"封存人取消到期清除（原清除时刻: {previous}）",
             )
             result = {"document_id": doc_id, "status": doc["status"], "purge_at": None}
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 一次性阅览凭证（无账号的外部复核人）
+#
+# 当前封存人可凭资料编号为“已开封”资料签发不可猜测的一次性阅览凭证：明文为
+# 256 位随机串（仅签发响应返回一次），库内只存其 SHA-256 摘要；截止时刻必须
+# 带时区、在未来，且严格早于已安排的清除时刻（资料必然先于截止被清除时签发
+# 无意义，直接拒绝）。外部复核人无需账号，凭明文在截止前可读取正文及摘要，
+# 恰好一次：全部“检查 + 兑付”在 BEGIN IMMEDIATE 事务内完成，并发兑换至多一次
+# 成功。当前封存人可凭凭证编号在兑换前撤销。
+#
+# 兑换前先在同一写事务内结算到期清除：清除时刻与兑换同刻时清除优先，凭证
+# 随即拒绝兑付。过期、撤销、已兑付、无效凭证或已清除资料统一返回同一 403
+# 文案，绝不泄露正文或资料存在性。成功、签发与撤销均追加原有审计链。
+# ---------------------------------------------------------------------------
+
+# 所有拒绝路径统一文案：不区分凭证不存在/过期/撤销/已兑付/资料已清除，
+# 既不泄露凭证状态，也不泄露资料是否存在。
+PASS_DENY = "阅览凭证无效或不可使用"
+
+# 兑换失败路径在锁外统一返回的错误（复用同一对象，响应体无任何资料信息）。
+_pass_denied = err(403, PASS_DENY)
+
+
+@app.post("/documents/{doc_id}/reading-passes", status_code=201)
+def create_reading_pass(
+    doc_id: int,
+    payload: ReadingPassIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """封存人为已开封资料签发一次性阅览凭证（明文仅此一次返回）。"""
+    doc = load_doc_for_participant(db, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, "只有封存人可以签发阅览凭证")
+
+    expires_at = utc_str(payload.expires_at)
+    now = utc_str(now_utc())
+    if expires_at <= now:
+        raise err(400, "截止时刻必须晚于当前时间")
+
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 临界区第一步与其他写路径一致：先确定性结算到点开封与到期清除。
+        resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now, doc_id)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["owner_id"] != user["id"]:
+            # 交接可能在预校验后并发完成：锁内以当前封存人为准
+            raise err(403, "只有封存人可以签发阅览凭证")
+        if doc["status"] == "purged":
+            # 清除可能刚在本临界区生效：必须先提交，错误延迟到提交后抛出
+            post_commit_error = err(409, "资料已清除，不能签发阅览凭证")
+        elif doc["status"] != "opened":
+            raise err(409, "资料未开封，不能签发阅览凭证")
+        elif expires_at <= now:
+            raise err(400, "截止时刻必须晚于当前时间")
+        elif doc["purge_at"] is not None and not expires_at < doc["purge_at"]:
+            # 截止时刻必须严格早于当前已安排的清除时刻：清除安排可在预校验后
+            # 被并发改期，因此一律以锁内当前 purge_at 为准（同刻也不行——
+            # 清除与兑换同刻时清除优先，凭证永远无法兑付）。
+            raise err(400, "截止时刻必须早于已安排的清除时刻")
+        else:
+            token = secrets.token_hex(32)  # 256 位不可猜测明文，仅此一次返回
+            cur = tx.execute(
+                "INSERT INTO reading_passes"
+                " (document_id, issued_by, token_hash, expires_at, status, created_at)"
+                " VALUES (?, ?, ?, ?, 'active', ?)",
+                (doc_id, user["id"], sha256_hex(token), expires_at, now),
+            )
+            pass_id = cur.lastrowid
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="reading_pass_issued",
+                document_id=doc_id,
+                detail=f"签发一次性阅览凭证 {pass_id}，兑换截止时刻: {expires_at}（明文仅本次返回，库内只存摘要）",
+            )
+            result = {
+                "pass_id": pass_id,
+                "document_id": doc_id,
+                "token": token,
+                "expires_at": expires_at,
+                "status": "active",
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.post("/reading-passes/redeem")
+def redeem_reading_pass(
+    payload: RedeemReadingPassIn,
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """外部复核人无需账号，凭明文在截止前一次性兑换正文及摘要。
+
+    过期、撤销、已兑付、无效凭证或资料已清除（含与兑换同刻、清除优先）
+    统一 403 且文案相同，不泄露正文或资料存在性。
+    """
+    now = utc_str(now_utc())
+    token_hash = sha256_hex(payload.token)
+
+    # 锁外预查：凭证无效（含随机猜测）时直接拒绝，不进入写临界区，
+    # 也不触发任何状态变更或清除结算，避免无效兑换影响其他资料。
+    pre = db.execute(
+        "SELECT id, document_id, status, expires_at FROM reading_passes WHERE token_hash = ?",
+        (token_hash,),
+    ).fetchone()
+    if pre is None:
+        raise _pass_denied
+
+    post_commit_error: HTTPException | None = None
+    response: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 兑换前先在同一事务结算到期清除：清除时刻与兑换同刻时清除优先，
+        # 随后该凭证即按“资料已清除”拒绝兑付（purged 先随本事务提交）。
+        resolve_due_waiting(tx, now)
+        purged_here = purge_due_documents(tx, now, pre["document_id"]) > 0
+
+        row = tx.execute(
+            "SELECT * FROM reading_passes WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        doc = tx.execute(
+            "SELECT * FROM documents WHERE id = ?", (row["document_id"],)
+        ).fetchone()
+
+        # 兑付条件（任一不满足统一拒绝）：凭证仍 active、未过截止时刻、
+        # 资料已开封且未清除。
+        valid = (
+            row["status"] == "active"
+            and row["expires_at"] > now
+            and doc is not None
+            and doc["status"] == "opened"
+        )
+        if not valid:
+            if purged_here:
+                # 清除刚在本临界区生效：状态变更必须先提交，拒绝延迟到提交后
+                post_commit_error = err(403, PASS_DENY)
+            else:
+                raise _pass_denied
+        else:
+            tx.execute(
+                "UPDATE reading_passes SET status='redeemed', redeemed_at=? WHERE id = ?",
+                (now, row["id"]),
+            )
+            add_audit(
+                tx,
+                actor_id=None,  # 外部复核人无账号
+                action="reading_pass_redeemed",
+                document_id=doc["id"],
+                detail=f"一次性阅览凭证 {row['id']} 在截止前兑付，外部复核人读取正文一次",
+            )
+            response = {
+                "pass_id": row["id"],
+                "document_id": doc["id"],
+                "status": "redeemed",
+                "body": doc["body"],
+                "digest": doc["digest"],
+                "redeemed_at": now,
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert response is not None
+    return response
+
+
+@app.post("/reading-passes/{pass_id}/revoke")
+def revoke_reading_pass(
+    pass_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """当前封存人凭凭证编号在兑换前撤销一次性阅览凭证。"""
+    pre = db.execute(
+        "SELECT p.id, p.document_id, p.status, p.expires_at, d.owner_id"
+        " FROM reading_passes p JOIN documents d ON d.id = p.document_id"
+        " WHERE p.id = ?",
+        (pass_id,),
+    ).fetchone()
+    # 凭证不存在 / 非本人资料：统一 403，不区分凭证是否存在
+    if pre is None or pre["owner_id"] != user["id"]:
+        raise err(403, "无权操作该凭证或凭证不存在")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 与其他写路径一致：先结算到点清除。清除若在本临界区生效，清除先
+        # 提交，撤销失败（凭证已随资料失效）延迟到提交后返回。
+        purge_due_documents(tx, now, pre["document_id"])
+
+        row = tx.execute("SELECT * FROM reading_passes WHERE id = ?", (pass_id,)).fetchone()
+        doc = tx.execute(
+            "SELECT * FROM documents WHERE id = ?", (row["document_id"],)
+        ).fetchone()
+        if doc["owner_id"] != user["id"]:
+            raise err(403, "无权操作该凭证或凭证不存在")
+        if doc["status"] == "purged":
+            post_commit_error = err(409, "资料已清除，凭证已失效，无法撤销")
+        elif row["status"] == "redeemed":
+            raise err(409, "凭证已兑付，不能撤销")
+        elif row["status"] == "revoked":
+            raise err(409, "凭证已撤销")
+        elif row["expires_at"] <= now:
+            raise err(409, "已过截止时刻，凭证已失效，不能撤销")
+        else:
+            tx.execute(
+                "UPDATE reading_passes SET status='revoked', revoked_at=? WHERE id = ?",
+                (now, pass_id),
+            )
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="reading_pass_revoked",
+                document_id=row["document_id"],
+                detail=f"封存人在兑换前撤销一次性阅览凭证 {pass_id}",
+            )
+            result = {
+                "pass_id": pass_id,
+                "document_id": row["document_id"],
+                "status": "revoked",
+                "revoked_at": now,
+            }
     if post_commit_error is not None:
         raise post_commit_error
     assert result is not None

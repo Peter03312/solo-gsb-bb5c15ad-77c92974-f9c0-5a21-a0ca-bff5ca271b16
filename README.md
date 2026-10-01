@@ -11,6 +11,12 @@
 完成后**签发审计快照**（资料编号、摘要、当前状态与开封/清除时刻、按原顺序
 排列且标明截止序号的审计记录，不含正文或密钥），由服务端持久化的 Ed25519
 密钥签名；离线复核人凭“快照 + 签名 + 事先信任的公钥”验真。
+当前封存人还可为**已开封**资料签发**一次性阅览凭证**：截止时刻带时区、在未来
+且严格早于已安排的清除时刻，明文为 256 位随机串（仅签发响应返回一次，库内只
+存 SHA-256 摘要），无账号的外部复核人凭明文在截止前可读取**一次**正文及摘要，
+并发兑换至多一次成功；封存人可凭凭证编号在兑换前撤销；兑换前在同一事务先结算
+到期清除（同刻清除优先）；过期、撤销、已兑付、无效凭证或已清除资料统一拒绝，
+不泄露正文或资料存在性。
 技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
@@ -44,6 +50,13 @@
 | 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`、`purge_scheduled/rescheduled/canceled`、`purged`、`audit_snapshot_issued`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
 | 审计快照签发 | 当前封存人或当前指定见证人可签发：快照含资料编号、摘要、当前状态与开封/清除时刻、按原顺序排列且标明截止序号（`audit_upto`）的审计记录，不含正文或密钥；签发在同一写事务内先完成到点开封/到期清除等确定性结算再取数，快照对应一个已提交的一致状态 |
 | 快照签名与离线验真 | 服务端 Ed25519 密钥持久化于 `signing_keys` 表（重启后旧签名仍可验证）；复核人提交快照、签名及事先信任的公钥验真，字段或记录顺序被篡改、签名不匹配、版本不支持或公钥无效均明确失败（400），不以包内自带公钥建立信任 |
+| 一次性阅览凭证 | 当前封存人为**已开封**资料签发：明文为 256 位随机串（`secrets.token_hex(32)`，不可猜测），仅签发响应返回一次；库内只存 SHA-256 摘要（`reading_passes.token_hash`，带 UNIQUE 约束），响应另给自增、非随机的 `pass_id` 供撤销 |
+| 凭证截止时刻 | `expires_at` 必须带时区、晚于当前时间，且**严格早于**已安排的清除时刻（同刻也不行——清除与兑换同刻时清除优先）；清除安排在签发临界区内被并发改期时以锁内当前 `purge_at` 为准 |
+| 一次性兑换 | 外部复核人**无需账号**，凭明文 `POST /reading-passes/redeem` 在截止前读取一次正文及摘要；“查状态 + 兑付”全部在 `BEGIN IMMEDIATE` 事务内完成，并发兑换恰好一次成功（先成功者 `redeemed`，其余统一 403） |
+| 兑换先结算清除 | 兑换临界区第一步先做确定性到点开封与到期清除：清除时刻与兑换同刻时**清除优先**，凭证随即拒绝兑付（清除先随事务提交，拒绝在提交后返回） |
+| 凭证撤销 | 当前封存人凭 `pass_id` 可在兑换前撤销；过期/已兑付/已撤销/资料已清除均拒绝；撤销权按资料当前 `owner_id` 判定 |
+| 凭证拒绝不泄露 | 过期、撤销、已兑付、无效（猜测）凭证或已清除资料的兑换请求统一 `403 {"detail":"阅览凭证无效或不可使用"}`，响应不含正文、摘要、资料编号或资料状态；无效凭证不进入写临界区、不触发任何结算 |
+| 凭证留痕 | 签发/兑付/撤销分别追加 `reading_pass_issued` / `reading_pass_redeemed`（actor 为空，表示无账号的外部复核人）/ `reading_pass_revoked` 到原有 `audit_log` 同一条审计链；审计 detail 只记凭证编号，绝不明文 token |
 
 ### 请求状态机
 
@@ -146,6 +159,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/documents/{id}/audit-snapshots` | 当前封存人或当前指定见证人签发审计快照，返回快照、签名与公钥标识 |
 | GET | `/audit-snapshots/public-key` | 查询快照签名公钥与标识（无需凭据，供复核人事先建立信任） |
 | POST | `/audit-snapshots/verify` | 离线验真：`{snapshot, signature, public_key}`，无需凭据 |
+| POST | `/documents/{id}/reading-passes` | 当前封存人为已开封资料签发一次性阅览凭证：`{expires_at}`（带时区、未来、严格早于已安排清除时刻）；明文 `token` 仅此一次返回，另给 `pass_id` |
+| POST | `/reading-passes/redeem` | **无需凭据**：外部复核人凭 `{token}` 在截止前一次性兑换正文及摘要 |
+| POST | `/reading-passes/{pass_id}/revoke` | 当前封存人在兑换前撤销凭证 |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
@@ -156,8 +172,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 冲突（重复同意、重复开封、请求已撤销/到期、waiting 下再同意、已有进行中请求、
 新见证人已在名单、资料已开封仍替换、重复发起待确认交接邀请、确认已撤回/逾期/
 已确认的邀请、交接时资料已开封、资料已清除仍开封/替换/交接/安排清除、
-清除时刻已到仍改期/取消、无清除安排仍取消等）`409`。错误体统一为
+清除时刻已到仍改期/取消、无清除安排仍取消、撤销已兑付/已撤销/已过期的阅览
+凭证等）`409`。错误体统一为
 `{"detail": "..."}`，不含任何正文内容。
+
+阅览凭证接口的状态码另有约定：签发时过去/不早于清除时刻 `400`、时间不带
+时区 `422`、非当前封存人/非参与方 `403`、资料未开封/已清除 `409`；兑换接口
+对过期、撤销、已兑付、无效明文、已清除资料一律返回**完全相同**的
+`403 {"detail":"阅览凭证无效或不可使用"}`，不区分任何原因、不泄露资料存在性；
+撤销时非封存人/编号不存在统一 `403`，已兑付/已撤销/已过期/资料已清除 `409`。
 
 ### 最早开封时刻（earliest_open_at）
 
@@ -507,6 +530,93 @@ curl -sS -X POST $BASE/audit-snapshots/verify \
 # 公钥换成别的有效 Ed25519 公钥 -> 400 签名不匹配（信任只来自事先信任的公钥）
 ```
 
+### 一次性阅览凭证（reading pass，外部复核人无账号）
+
+当前封存人需要把**已开封**资料的正文临时交给一名没有本服务账号的外部复核人时，
+可签发一张**一次性阅览凭证**：
+
+- `POST /documents/{id}/reading-passes`（需当前封存人 `X-API-Key`），请求体
+  `{"expires_at": "<带时区 ISO-8601 时刻>"}`。`expires_at` 必须：带时区
+  （不带 `422`）、晚于当前时间（过去 `400`）、且**严格早于**该资料已安排的
+  清除时刻（不早于或未开封/已清除 `400/409`）。成功 `201`：
+
+  ```json
+  {
+    "pass_id": 7,
+    "document_id": 3,
+    "token": "b69b5f18c1…（64 位十六进制 = 256 位随机串）",
+    "expires_at": "2026-10-02T08:00:00+00:00",
+    "status": "active"
+  }
+  ```
+
+  **`token` 明文只在本次响应出现一次**，服务端只存它的 SHA-256 摘要，之后无法
+  找回；`pass_id` 是自增、非随机的凭证编号，仅供封存人撤销使用，不能用于兑换。
+- `POST /reading-passes/redeem`（**无需任何账号凭据**），请求体
+  `{"token": "<明文>"}`。外部复核人在截止前可读取**恰好一次**正文及摘要：
+
+  ```json
+  {
+    "pass_id": 7,
+    "document_id": 3,
+    "status": "redeemed",
+    "body": "资料正文……",
+    "digest": "ac562d71…",
+    "redeemed_at": "2026-10-01T09:30:00+00:00"
+  }
+  ```
+
+  “查状态 + 兑付”在同一个 `BEGIN IMMEDIATE` 事务内完成，**并发兑换至多一次
+  成功**；成功者读到正文，其余并发请求全部得到下述统一 403。再兑付、过期兑付、
+  撤销后兑付、猜测的明文、资料已清除（含清除时刻与兑换同刻、**清除优先**）
+  全部返回：
+
+  ```json
+  {"detail": "阅览凭证无效或不可使用"}
+  ```
+
+  状态码恒为 `403`，文案完全相同，响应不含正文、摘要、资料编号或资料状态，
+  因此外部调用方无法区分“凭证不存在 / 已过期 / 已撤销 / 已兑付 / 资料已清除”，
+  也无法探测资料是否存在。兑换临界区会先结算到期清除；若清除恰在本次兑换的
+  同一事务生效，清除先提交、兑换随后被拒。
+- `POST /reading-passes/{pass_id}/revoke`（需当前封存人 `X-API-Key`）：在兑换
+  **之前**撤销。成功 `200` 返回 `{"pass_id": 7, "document_id": 3,
+  "status": "revoked", "revoked_at": "…"}`；已兑付/已撤销/已过期/资料已清除
+  为 `409`，非封存人或凭证编号不存在统一 `403`。
+- 签发、兑付与撤销分别向该资料原有的 `audit_log` 追加
+  `reading_pass_issued`、`reading_pass_redeemed`（`actor` 为 `null`，
+  表示无账号的外部复核人）、`reading_pass_revoked`；审计明细只记录凭证编号，
+  绝不记录明文 token。既有的参与方读权限、到期清除规则与审计快照约定均不变。
+
+> 传输安全：明文 token 等同于这一次阅读的钥匙，应通过带外可信渠道（如加密
+> 消息）一次性转交；生产部署应在 HTTPS 后运行。凭证不记名，持有者即可在窗口内
+> 兑换，因此封存人应把 `expires_at` 设为完成复核所需的最短时间，并在误发时
+> 立即凭 `pass_id` 撤销。
+
+```bash
+# 封存人签发（资料须已开封；截止时刻取 1 小时后，必须早于已安排的清除时刻）
+EXPIRES=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).isoformat())")
+curl -sS -X POST $BASE/documents/3/reading-passes \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"expires_at\":\"$EXPIRES\"}"
+# -> {"pass_id":7,"token":"b69b5f18…","expires_at":"…","status":"active"}
+#    明文 token 只显示这一次，请通过可信带外渠道转交外部复核人
+
+# 外部复核人（没有账号、不带 X-API-Key）在截止前兑换一次
+curl -sS -X POST $BASE/reading-passes/redeem -H 'Content-Type: application/json' \
+  -d '{"token":"b69b5f18…"}'
+# -> {"status":"redeemed","body":"…","digest":"…",...}
+
+# 第二次（或过期/撤销/猜测的明文）-> 统一 403，不泄露任何资料信息
+curl -sS -X POST $BASE/reading-passes/redeem -H 'Content-Type: application/json' \
+  -d '{"token":"b69b5f18…"}'
+# -> {"detail":"阅览凭证无效或不可使用"}
+
+# 封存人在兑换前撤销（另一张未兑付的凭证）
+curl -sS -X POST $BASE/reading-passes/8/revoke -H "X-API-Key: $OWNER_KEY"
+# -> {"pass_id":8,"status":"revoked",...}
+```
+
 ### 调用示例（curl）
 
 ```bash
@@ -562,6 +672,7 @@ python3 examples/demo_replace_witness.py # 见证人替换：直接换人 / 退�
 python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾期/确认失效旧请求/转移身份/开封后邀请失效
 python3 examples/demo_purge.py           # 到期清除：安排/改期/取消/到点清除/连带失效/时序规则/交接后管理权
 python3 examples/demo_audit_snapshot.py  # 审计快照：签发/验真/篡改失败/版本与公钥失败/交接后旧封存人禁签
+python3 examples/demo_reading_pass.py    # 一次性阅览凭证：签发/无账号兑换一次/撤销/过期/同刻清除优先/统一拒绝/审计链
 ```
 
 ### 典型拒绝场景
@@ -612,21 +723,29 @@ python -m pytest -q
 与到期清除结算、签发留痕、篡改字段/调换记录顺序/版本不支持/公钥无效/错公钥/
 夹带公钥自封包全部明确失败、键序无关验真、重启后旧签名仍可验证、真实 uvicorn +
 多线程的**并发签发 vs 第二票同意**（快照始终对应一个已提交的一致状态），
-以及 Ed25519 纯标准库实现的 RFC 8032 官方测试向量。
+以及 Ed25519 纯标准库实现的 RFC 8032 官方测试向量；
+另含一次性阅览凭证：签发校验（仅当前封存人、资料已开封、截止时刻带时区且在
+未来并严格早于已安排清除时刻）、明文仅返回一次且全库只存 SHA-256 摘要、
+无账号兑换一次正文及摘要、重复/过期/撤销/已兑付/猜测明文/已清除资料统一 403
+且不泄露正文或资料存在性、兑换前撤销与过期不可撤销、兑换临界区内结算到期清除
+（清除与兑换同刻清除优先、临界区刚触发的清除先提交再拒绝）、签发/兑付/撤销
+均入原有审计链且明细不含明文、既有参与方读权限与审计快照链路不变，以及真实
+uvicorn + 8 线程屏障并发的**并发兑换恰好一次成功**（库内恰好一条 redeemed、
+一条兑付审计）。
 
 ## 项目结构
 
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、快照验真入参校验）
+  db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范（含 reading_passes 凭证表）
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、快照验真、阅览凭证签发/兑换入参校验）
   ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
   snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py 端到端示例
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_reading_pass.py 端到端示例
 tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、并发、重启）
 Dockerfile
 docker-compose.yml
